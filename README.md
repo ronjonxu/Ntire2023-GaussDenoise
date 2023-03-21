@@ -1,5 +1,29 @@
 # [NTIRE 2023 Challenge on Image Denoising](https://cvlai.net/ntire/2023/) @ [CVPR 2023](https://cvpr2023.thecvf.com/)
 
+## How to load model?
+1.  download the checkpoint
+    Du to the GitHub's file size limit is 100.00 MB, our model checkpoint can't 
+    be push to github.
+    The checkpoint team23_NAF.pth can be downloaded from google link below:
+    https://drive.google.com/file/d/17euA75OwQj22_moEbGLadee2rCNzM9qO/view?usp=sharing
+
+    In test_demo.py, line 
+    ```python
+    torch.hub.download_url_to_file(url, '.model_zoo/team23_NAF.pth')
+    # download checkpoint from url first and put it in model_zoo
+    ```
+2. load the checkpoint
+    ```python
+    # you can also use function load_network_path(net, path, device):
+    new_state_dict = {}
+    model_state = model.state_dict()
+    for k, v in state_dict.items():
+        if k in model_state:
+            new_state_dict[k] = v
+    model.load_state_dict(new_state_dict, strict=True)
+    ```
+
+
 ## How to test the baseline model?
 
 1. `git clone https://github.com/ofsoundof/NTIRE2023_Dn50.git`

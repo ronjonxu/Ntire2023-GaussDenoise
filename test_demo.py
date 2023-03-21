@@ -4,7 +4,6 @@ import torch
 import argparse
 import json
 import glob
-import wget
 from pprint import pprint
 from utils.model_summary import get_model_activation, get_model_flops
 from utils import utils_logger
@@ -33,9 +32,19 @@ def select_model(args, device):
                 new_state_dict[k.replace("model.", "")] = v
         model.load_state_dict(new_state_dict, strict=True)
     elif model_id == 23:
-        model = team23_NAF.NAF(width=128, enc_blk_nums=[2, 2, 2, 8], dec_blk_nums=[2, 2, 2, 4])
+        from models.team23_NAF import NAF
+        name, data_range = f"{model_id:02}_RFDN_baseline", 1.0
+        model = NAF(width=128, enc_blk_nums=[2, 2, 2, 8], dec_blk_nums=[2, 2, 2, 4])
         url = 'https://drive.google.com/file/d/17euA75OwQj22_moEbGLadee2rCNzM9qO/view?usp=sharing'
-        wget.download(url, 'model_zoo/team23_NAF.pth')
+        torch.hub.download_url_to_file(url, '.model_zoo/team23_NAF.pth')
+        # load check point 
+        # you can also use function load_network_path(net, path, device):
+        new_state_dict = {}
+        model_state = model.state_dict()
+        for k, v in state_dict.items():
+            if k in model_state:
+                new_state_dict[k] = v
+        model.load_state_dict(new_state_dict, strict=True)
     else:
         raise NotImplementedError(f"Model {model_id} is not implemented.")
 
@@ -46,7 +55,7 @@ def select_model(args, device):
         v.requires_grad = False
     model = model.to(device)
     # load checkpoint
-    load_network_path(model, 'NTIRE2023_Dn/model_zoo/team23_NAF.pth', device)
+    # load_network_path(model, 'NTIRE2023_Dn/model_zoo/team23_NAF.pth', device)
     return model, name, data_range, tile
 
 
@@ -81,7 +90,11 @@ def select_dataset(data_dir, mode):
 def forward(img_lq, model, tile=None, tile_overlap=32, scale=1):
     if tile is None:
         # test the image as a whole
-        output = model(img_lq)
+        shape = img_lq.shape
+        if shape[-1] > 2000 or shape[-2] > 2000:
+            output = model(img_lq, 80)
+        else:
+            output = model(img_lq, 256)
     else:
         # test the image tile by tile
         b, c, h, w = img_lq.size()

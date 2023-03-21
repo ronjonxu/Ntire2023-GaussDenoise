@@ -6,10 +6,12 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 
+
 class NAF(nn.Module):
 
-    def __init__(self, img_channel=3, width=180, middle_blk_num=12, enc_blk_nums=[2, 2, 4, 8], dec_blk_nums=[2, 2, 2, 4]):
+    def __init__(self, opt, img_channel=3, width=32, middle_blk_num=12, enc_blk_nums=[2, 2, 4, 8], dec_blk_nums=[2, 2, 4, 4]):
         super().__init__()
+        self.opt = opt
         self.intro = nn.Conv2d(in_channels=img_channel, out_channels=width, kernel_size=3, padding=1, stride=1, groups=1,
                               bias=True)
         self.ending = nn.Conv2d(in_channels=width, out_channels=3, kernel_size=3, padding=1, stride=1, groups=1,
@@ -24,8 +26,8 @@ class NAF(nn.Module):
         chan = width
         for num in enc_blk_nums:
             self.encoders.append(
-                nn.Sequential(
-                    *[NAFBlock(chan) for _ in range(num)]
+                nn.ModuleList(
+                    [NAFBlock(chan) for _ in range(num)]
                 )
             )
             self.downs.append(
@@ -34,8 +36,8 @@ class NAF(nn.Module):
             chan = chan * 2
 
         self.middle_blks = \
-            nn.Sequential(
-                *[NAFBlock(chan) for _ in range(middle_blk_num)]
+            nn.ModuleList(
+                [NAFBlock(chan) for _ in range(middle_blk_num)]
             )
 
         for num in dec_blk_nums:
@@ -47,63 +49,39 @@ class NAF(nn.Module):
             )
             chan = chan // 2
             self.decoders.append(
-                nn.Sequential(
-                    *[NAFBlock(chan) for _ in range(num)]
+                nn.ModuleList(
+                    [NAFBlock(chan) for _ in range(num)]
                 )
             )
 
         self.padder_size = 2 ** len(self.encoders)
 
-    def forward(self, inp):
-        def _transform(v, op):
-            # if self.precision != 'single': v = v.float()
-            v2np = v.data.cpu().numpy()
-            if op == 'v':
-                tfnp = v2np[:, :, :, ::-1].copy()
-            elif op == 'h':
-                tfnp = v2np[:, :, ::-1, :].copy()
-            elif op == 't':
-                tfnp = v2np.transpose((0, 1, 3, 2)).copy()
-            ret = torch.Tensor(tfnp).to(self.device)
-            # if self.precision == 'half': ret = ret.half()
-            return ret
-        lr_list = [inp]
-        for tf in 'v', 'h', 't':
-            lr_list.extend([_transform(t, tf) for t in lr_list])
-        sr_list = []
-        for inp in lr_list:
-            B, C, H, W = inp.shape
-            inp = self.check_image_size(inp)
-            # print(inp.shape)
-            x = self.intro(inp)
+    def forward(self, inp, base):
+        B, C, H, W = inp.shape
+        inp = self.check_image_size(inp)
+        # print(inp.shape)
+        x = self.intro(inp)
 
-            encs = []
+        encs = []
 
-            for encoder, down in zip(self.encoders, self.downs):
-                x = encoder(x)
-                encs.append(x)
-                x = down(x)
+        for encoder, down in zip(self.encoders, self.downs):
+            for nafb in encoder:
+                x = nafb(x, base)
+            encs.append(x)
+            x = down(x)
 
-            x = self.middle_blks(x)
+        for nafb in self.middle_blks:
+            x = nafb(x, base)
 
-            for decoder, up, enc_skip in zip(self.decoders, self.ups, encs[::-1]):
-                x = up(x)
-                x = x + enc_skip
-                x = decoder(x)
+        for decoder, up, enc_skip in zip(self.decoders, self.ups, encs[::-1]):
+            x = up(x)
+            x = x + enc_skip
+            for nafb in decoder:
+                x = nafb(x, base)
 
-            x = self.ending(x)
-            x = x + inp
-            sr_list.append(x[:, :, :H, :W])
-        for i in range(len(sr_list)):
-            if i > 3:
-                sr_list[i] = _transform(sr_list[i], 't')
-            if i % 4 > 1:
-                sr_list[i] = _transform(sr_list[i], 'h')
-            if (i % 4) % 2 == 1:
-                sr_list[i] = _transform(sr_list[i], 'v')
-        output_cat = torch.cat(sr_list, dim=0)
-        output = output_cat.mean(dim=0, keepdim=True)
-        return output
+        x = self.ending(x)
+        x = x + inp
+        return x[:, :, :H, :W]
 
     def check_image_size(self, x):
         _, _, h, w = x.size()
@@ -133,7 +111,7 @@ class NAFBlock(nn.Module):
         
         # Simplified Channel Attention
         self.sca = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
+            AvgPool2d(),
             nn.Conv2d(in_channels=dw_channel // 2, out_channels=dw_channel // 2, kernel_size=1, padding=0, stride=1,
                       groups=1, bias=True),
         )
@@ -157,7 +135,7 @@ class NAFBlock(nn.Module):
         self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
         self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
 
-    def forward(self, inp):
+    def forward(self, inp, base_size):
         x = inp
 
         x = self.norm1(x)
@@ -166,7 +144,9 @@ class NAFBlock(nn.Module):
         x = self.conv2(x)
         x = self.sg(x)
         # v0.5 no sca
-        x = x * self.sca(x)
+        t = (x, base_size)
+        # print(t[1])
+        x = x * self.sca(t)
         x = self.conv3(x)
 
         x = self.dropout1(x)
@@ -220,3 +200,69 @@ class LayerNorm2d(nn.Module):
 
     def forward(self, x):
         return LayerNormFunction.apply(x, self.weight, self.bias, self.eps)
+
+
+
+train_size=(1,3,256,256)
+
+class AvgPool2d(nn.Module):
+    def __init__(self, kernel_size=None, auto_pad=True, fast_imp=False):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.auto_pad = auto_pad
+        self.base_size = 0
+
+        # only used for fast implementation
+        self.fast_imp = fast_imp
+        self.rs = [5,4,3,2,1]
+        self.max_r1 = self.rs[0]
+        self.max_r2 = self.rs[0]
+
+           
+    def forward(self, inp):
+        x = inp[0]
+        base_size = inp[1]
+        self.base_size = base_size
+        if self.kernel_size is None and base_size:
+            if isinstance(self.base_size, int):
+                self.base_size = (self.base_size, self.base_size)
+            self.kernel_size = list(self.base_size)
+            self.kernel_size[0] = x.shape[2]*self.base_size[0]//train_size[-2]
+            self.kernel_size[1] = x.shape[3]*self.base_size[1]//train_size[-1]
+            
+            # only used for fast implementation
+            self.max_r1 = max(1, self.rs[0]*x.shape[2]//train_size[-2])
+            self.max_r2 = max(1, self.rs[0]*x.shape[3]//train_size[-1])
+
+        if self.fast_imp:   # Non-equivalent implementation but faster
+            h, w = x.shape[2:]
+            if self.kernel_size[0]>=h and self.kernel_size[1]>=w:
+                out = F.adaptive_avg_pool2d(x,1)
+            else:
+                r1 = [r for r in self.rs if h%r==0][0]
+                r2 = [r for r in self.rs if w%r==0][0]
+                # reduction_constraint
+                r1 = min(self.max_r1, r1)
+                r2 = min(self.max_r2, r2)
+                s = x[:,:,::r1, ::r2].cumsum(dim=-1).cumsum(dim=-2)
+                n, c, h, w = s.shape
+                k1, k2 = min(h-1, self.kernel_size[0]//r1), min(w-1, self.kernel_size[1]//r2)
+                out = (s[:,:,:-k1,:-k2]-s[:,:,:-k1,k2:]-s[:,:,k1:,:-k2]+s[:,:,k1:,k2:])/(k1*k2)
+                out = torch.nn.functional.interpolate(out, scale_factor=(r1,r2))
+        else:
+            n, c, h, w = x.shape
+            s = x.cumsum(dim=-1).cumsum(dim=-2)
+            s = torch.nn.functional.pad(s, (1,0,1,0)) # pad 0 for convenience
+            k1, k2 = min(h, self.kernel_size[0]), min(w, self.kernel_size[1])
+            s1, s2, s3, s4 = s[:,:,:-k1,:-k2],s[:,:,:-k1,k2:], s[:,:,k1:,:-k2], s[:,:,k1:,k2:]
+            out = s4+s1-s2-s3
+            out = out / (k1*k2)
+    
+        if self.auto_pad:
+            n, c, h, w = x.shape
+            _h, _w = out.shape[2:]
+            # print(x.shape, self.kernel_size)
+            pad2d = ((w - _w)//2, (w - _w + 1)//2, (h - _h) // 2, (h - _h + 1) // 2)
+            out = torch.nn.functional.pad(out, pad2d, mode='replicate')
+        
+        return out
